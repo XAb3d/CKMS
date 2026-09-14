@@ -84,6 +84,30 @@ def parse_date_value(value):
         return None
 
 
+def parse_decimal_value(value):
+    """
+    Parses a CurBal-style value into a float suitable for a DECIMAL column.
+    Source files format this field in different ways (plain digits, padded
+    with spaces, comma thousand-separators) -- any of these fails ODBC
+    parameter binding to a DECIMAL column if passed through raw, the same
+    way an unparsed date fails binding to a DATE column. Strips whitespace
+    and thousand-separator commas so the value can be stored -- a format
+    translation only, never a correction of the value itself. Does not
+    infer or insert a decimal point that isn't present. The complete
+    original text is preserved unchanged in RawPayload regardless.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return None
+    s = s.replace(",", "")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # I/O helpers
 # ---------------------------------------------------------------------------
