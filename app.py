@@ -1,73 +1,85 @@
 """
 CKMS — Customer Key Management System
-Streamlit interface for the automated monthly data-cleaning pipeline.
+Streamlit interface for the registry-backed monthly data-cleaning pipeline.
+
+Replaces the old 3-4 file upload/diff flow: you now upload ONE file (this
+month's submission). Subscriber, reporting period, and submission type are
+parsed from the filename (<CODE><MMYY>_<IND|BUS>[_<SEQ>]); "previous month"
+raw/clean/UNL data comes from the registry database instead of a second and
+third upload. Ingestion is incremental -- each file is matched against
+everything already in the registry for that subscriber+period+type, without
+waiting for other sequence files in the same month.
 """
 
-import io
 import pandas as pd
 import streamlit as st
+from sqlalchemy import text
 
-import config
 import pipeline
+import ingestion
 
-st.set_page_config(page_title="CKMS — Monthly Cleaning Pipeline", layout="wide")
+st.set_page_config(page_title="CKMS — Registry-Backed Cleaning Pipeline", layout="wide")
 
 st.title("CKMS — Automated Monthly Data Cleaning")
 st.caption(
-    "Carries forward previously-cleaned identity/contact data for records "
-    "proven unchanged from last month. Never overwrites raw files."
+    "Upload this month's submission file. Subscriber, period, and type are read "
+    "from the filename; matching runs against the registry, not a second upload."
 )
 
+
 # ---------------------------------------------------------------------------
-# Sidebar: column mapping (override defaults per-subscriber if needed)
+# One cached DB connection per session, reused across every upload/run.
 # ---------------------------------------------------------------------------
+
+@st.cache_resource
+def get_cached_engine():
+    return ingestion.get_engine()
+
 
 with st.sidebar:
-    st.header("Column Settings")
-    st.caption("Defaults match the standard subscriber layout. Adjust if this subscriber's file differs.")
+    st.header("Database Connection")
+    st.caption("Registry database — separate from Cleanser's database (merge deferred to a future build).")
+    if st.button("Test Connection"):
+        try:
+            engine = get_cached_engine()
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            st.success("Connected.")
+        except Exception as e:
+            st.error(f"Connection failed: {e}")
 
-    with st.expander("Composite key fields", expanded=False):
-        key_facility = st.text_input("Facility Account Number column", config.KEY_FACILITY)
-        key_customer = st.text_input("Customer ID column", config.KEY_CUSTOMER)
-        key_date = st.text_input("Disbursement Date column", config.KEY_DATE)
-
-    with st.expander("Balance field", expanded=False):
-        balance_col = st.text_input("Current Balance column", config.BALANCE_COL)
-
-    with st.expander("Identity / contact fields", expanded=False):
-        identity_text = st.text_area(
-            "One field name per line",
-            "\n".join(config.IDENTITY_FIELDS + config.CONTACT_FIELDS),
-            height=220,
-        )
-
-    with st.expander("Rearrangement group", expanded=False):
-        rearr_text = st.text_area(
-            "Fields checked for 'same values, different order'",
-            "\n".join(config.REARRANGEMENT_GROUP),
-            height=80,
-        )
-
-three_key = [key_facility, key_customer, key_date]
-hash_fields = [f.strip() for f in identity_text.splitlines() if f.strip()]
-rearrangement_group = [f.strip() for f in rearr_text.splitlines() if f.strip()]
-force_string_cols = list(set(hash_fields + three_key))
+    st.divider()
+    st.caption(
+        "⚠️ Per-subscriber column-name overrides (e.g. a subscriber using "
+        "DRIVERLICNUM instead of DriverLicNum) are not yet supported here — "
+        "ingestion uses the fixed field names in config.py for every "
+        "subscriber. Flagging this as an open gap, not a silent limitation."
+    )
 
 # ---------------------------------------------------------------------------
-# File uploads
+# Upload
 # ---------------------------------------------------------------------------
 
-st.subheader("1. Upload Files")
-col1, col2, col3 = st.columns(3)
+st.subheader("1. Upload This Month's Submission")
+uploaded_file = st.file_uploader(
+    "Filename must follow <SUBSCRIBERCODE><MMYY>_<IND|BUS>[_<SEQ>], e.g. CPOINT0626_IND",
+    type=["csv", "xlsx"],
+)
 
-with col1:
-    current_file = st.file_uploader("Current Month Raw File", type=["csv", "xlsx"], key="current")
-with col2:
-    previous_raw_file = st.file_uploader("Previous Month Raw File", type=["csv", "xlsx"], key="prev_raw")
-with col3:
-    previous_clean_file = st.file_uploader("Previous Month Cleaned File", type=["csv", "xlsx"], key="prev_clean")
+parsed_meta = None
+if uploaded_file is not None:
+    try:
+        parsed_meta = ingestion.parse_filename(uploaded_file.name)
+        st.info(
+            f"**Subscriber:** {parsed_meta['subscriber_code']}  |  "
+            f"**Period:** {parsed_meta['reporting_period']}  |  "
+            f"**Type:** {parsed_meta['submission_type']}  |  "
+            f"**Sequence:** {parsed_meta['sequence_number']}"
+        )
+    except ValueError as e:
+        st.error(str(e))
 
-run_clicked = st.button("Run Pipeline", type="primary", disabled=not (current_file and previous_raw_file and previous_clean_file))
+run_clicked = st.button("Run Pipeline", type="primary", disabled=parsed_meta is None)
 
 # ---------------------------------------------------------------------------
 # Run
@@ -75,94 +87,18 @@ run_clicked = st.button("Run Pipeline", type="primary", disabled=not (current_fi
 
 if run_clicked:
     status = st.status("Running pipeline...", expanded=True)
-
     try:
-        status.update(label="Loading files...")
-        current_df = pipeline.load_file(current_file, force_string_cols)
-        previous_raw_df = pipeline.load_file(previous_raw_file, force_string_cols)
-        previous_clean_df = pipeline.load_file(previous_clean_file, force_string_cols)
-        status.write(
-            f"Loaded: current month ({len(current_df):,} rows), "
-            f"previous month ({len(previous_raw_df):,} rows), "
-            f"previous cleaned ({len(previous_clean_df):,} rows)"
-        )
+        engine = get_cached_engine()
 
-        status.update(label="Validating column names against configured settings...")
-        required_raw = list(dict.fromkeys(three_key + hash_fields + [balance_col]))
-        required_clean = list(dict.fromkeys(three_key + hash_fields))
-        pipeline.validate_columns(current_df, required_raw, "Current Month Raw File")
-        pipeline.validate_columns(previous_raw_df, required_raw, "Previous Month Raw File")
-        pipeline.validate_columns(previous_clean_df, required_clean, "Previous Month Cleaned File")
-        status.write("All required columns found.")
-
-        status.update(label="Step 1: Deduplicating current month file...")
-        deduped_df, dedup_log_df = pipeline.deduplicate(current_df, three_key, balance_col)
-        status.write(f"Removed {len(dedup_log_df):,} duplicate row(s). {len(deduped_df):,} rows remain.")
-
-        status.update(label="Step 2: Checking for disbursement date mismatches...")
-        working_df, date_mismatch_df = pipeline.date_mismatch_check(deduped_df, previous_raw_df, [key_facility, key_customer], key_date)
-        status.write(f"Pulled out {len(date_mismatch_df):,} date-mismatch row(s). {len(working_df):,} rows remain in the working set.")
-
-        status.update(label="Step 3 & 4: Matching keys and comparing identity/contact hashes...")
-        matched_df = pipeline.match_and_hash(working_df, previous_raw_df, three_key, hash_fields, rearrangement_group)
-
-        exact_df = matched_df[matched_df["Match Flag"] == "Exact match"].copy()
-        rearranged_df = matched_df[(matched_df["Match Flag"] == "Different") & (matched_df["Rearranged"])].copy()
-        true_different_df = matched_df[(matched_df["Match Flag"] == "Different") & (~matched_df["Rearranged"])].copy()
-        no_match_df = matched_df[matched_df["Match Flag"] == "No previous-month match"].copy()
-
-        status.write(
-            f"Exact match: {len(exact_df):,} | Rearranged (auto-processed): {len(rearranged_df):,} | "
-            f"Different (real change): {len(true_different_df):,} | No previous-month match: {len(no_match_df):,}"
-        )
-
-        status.update(label="Step 5: Cross-checking exact + rearranged matches against previous cleaned file...")
-        eligible_exact_df, not_found_exact_df = pipeline.clean_file_cross_check(
-            exact_df, previous_clean_df, three_key, not_found_label="Same hash, not found in cleaned file"
-        )
-        eligible_rearranged_df, not_found_rearranged_df = pipeline.clean_file_cross_check(
-            rearranged_df, previous_clean_df, three_key, not_found_label="Rearranged, not found in cleaned file"
-        )
-        status.write(
-            f"Eligible for carry-forward — exact: {len(eligible_exact_df):,}, rearranged: {len(eligible_rearranged_df):,} | "
-            f"Not found in cleaned file — exact: {len(not_found_exact_df):,}, rearranged: {len(not_found_rearranged_df):,}"
-        )
-
-        status.update(label="Step 6: Building cleaned + rearranged outputs...")
-        cleaned_output_df = pipeline.build_cleaned_output(eligible_exact_df, previous_clean_df, three_key, hash_fields)
-        rearranged_output_df = pipeline.build_cleaned_output(eligible_rearranged_df, previous_clean_df, three_key, hash_fields)
-        if not rearranged_output_df.empty:
-            rearranged_output_df["Source"] = "Auto-processed: same ID values, different field order"
-
-        status.update(label="Step 7: Building exception file...")
-        exception_output_df = pipeline.build_exception_output(
-            true_different_df, no_match_df, not_found_exact_df, not_found_rearranged_df
-        )
+        status.update(label=f"Ingesting {uploaded_file.name} and matching against the registry...")
+        outputs, summary, meta = ingestion.process_file(engine, uploaded_file, uploaded_file.name)
 
         status.update(label="Done", state="complete", expanded=False)
 
-        st.session_state.pop("workbook_bytes", None)  # clear any stale workbook from a previous run
-
-        st.session_state["outputs"] = {
-            "dedup_log": dedup_log_df,
-            "date_mismatch": date_mismatch_df,
-            "cleaned_output": cleaned_output_df,
-            "rearranged_output": rearranged_output_df,
-            "exception_output": exception_output_df,
-        }
-        st.session_state["summary"] = {
-            "Input records": len(current_df),
-            "Duplicates removed": len(dedup_log_df),
-            "Date mismatches pulled out": len(date_mismatch_df),
-            "Exact match": len(exact_df),
-            "Rearranged (auto-processed)": len(rearranged_df),
-            "Different (real change)": len(true_different_df),
-            "No previous-month match": len(no_match_df),
-            "Eligible for carry-forward (exact)": len(eligible_exact_df),
-            "Eligible for carry-forward (rearranged)": len(eligible_rearranged_df),
-            "Same hash, not found in cleaned file": len(not_found_exact_df),
-            "Rearranged, not found in cleaned file": len(not_found_rearranged_df),
-        }
+        st.session_state.pop("workbook_bytes", None)
+        st.session_state["outputs"] = outputs
+        st.session_state["summary"] = summary
+        st.session_state["meta"] = meta
 
     except ValueError as e:
         status.update(label="Column mismatch — see details below", state="error")
@@ -176,20 +112,27 @@ if run_clicked:
 # ---------------------------------------------------------------------------
 
 if "outputs" in st.session_state:
-    st.subheader("2. Summary")
     summary = st.session_state["summary"]
-    total_cleaned = summary["Eligible for carry-forward (exact)"] + summary["Eligible for carry-forward (rearranged)"]
-    total_exception = (
-        summary["Different (real change)"]
+    meta = st.session_state["meta"]
+
+    st.subheader("2. Summary")
+    total_auto = (
+        summary["Eligible for carry-forward (exact)"]
+        + summary["Eligible for carry-forward (rearranged)"]
+        + summary["Enriched (auto-processed)"]
+    )
+    total_unl = (
+        summary["Different (needs review)"]
         + summary["No previous-month match"]
         + summary["Same hash, not found in cleaned file"]
         + summary["Rearranged, not found in cleaned file"]
+        + summary["Previously UNL'd, still unresolved (carryover)"]
     )
     cols = st.columns(4)
     cols[0].metric("Input records", f"{summary['Input records']:,}")
-    cols[1].metric("Cleaned automatically", f"{total_cleaned:,}")
-    cols[2].metric("Sent to exception file", f"{total_exception:,}")
-    cols[3].metric("Date mismatches", f"{summary['Date mismatches pulled out']:,}")
+    cols[1].metric("Auto-cleaned", f"{total_auto:,}")
+    cols[2].metric("Sent to UNL", f"{total_unl:,}")
+    cols[3].metric("Date changes (info only)", f"{summary['Date changes logged (informational)']:,}")
 
     with st.expander("Full summary"):
         st.table(pd.DataFrame(summary.items(), columns=["Metric", "Count"]))
@@ -201,15 +144,16 @@ if "outputs" in st.session_state:
         return df.to_csv(index=False).encode("utf-8")
 
     labels = {
-        "dedup_log": ("Dedup Log File", "Duplicate rows removed, with balances and which row was kept"),
-        "date_mismatch": ("Date Mismatch File", "Same facility+customer, but disbursement date changed"),
-        "cleaned_output": ("Cleaned Output File", "Exact-match records with identity/contact fields carried forward"),
-        "rearranged_output": ("Rearranged Output File", "Same ID values found under different fields — auto-processed"),
-        "exception_output": ("Exception File", "Real changes, new records, and not-found-in-clean cases needing review"),
+        "dedup_log": ("Dedup Log", "Duplicate rows removed (3-key), with balances and which row was kept"),
+        "date_change_log": ("Date Changes (Info)", "Disbursement date differed from last period — informational only"),
+        "cleaned_output": ("Cleaned Output", "Exact-match records, identity/contact fields carried forward"),
+        "rearranged_output": ("Rearranged Output", "Same ID values under different fields — auto-processed"),
+        "enriched_output": ("Enriched Output", "New identity data added, no conflicts — auto-processed"),
+        "unl_output": ("UNL File", "Genuine conflicts, new records, and not-found cases needing review"),
     }
 
-    dl_cols = st.columns(5)
-    for i, key in enumerate(["dedup_log", "date_mismatch", "cleaned_output", "rearranged_output", "exception_output"]):
+    dl_cols = st.columns(len(labels))
+    for i, key in enumerate(labels.keys()):
         df = outputs[key]
         label, desc = labels[key]
         with dl_cols[i]:
@@ -217,7 +161,7 @@ if "outputs" in st.session_state:
             st.caption(f"{len(df):,} rows")
             st.caption(desc)
             st.download_button(
-                f"Download",
+                "Download",
                 data=to_csv_bytes(df) if not df.empty else b"",
                 file_name=f"{key}.csv",
                 mime="text/csv",
@@ -226,9 +170,8 @@ if "outputs" in st.session_state:
             )
 
     st.divider()
-    st.caption("Prefer one file with tabs instead of five separate CSVs?")
     if st.button("Prepare combined workbook (.xlsx)"):
-        with st.spinner("Building workbook... this takes longer than the CSVs at large file sizes."):
+        with st.spinner("Building workbook..."):
             st.session_state["workbook_bytes"] = pipeline.build_workbook(outputs, summary)
 
     if "workbook_bytes" in st.session_state:
@@ -241,14 +184,23 @@ if "outputs" in st.session_state:
         )
 
     st.subheader("4. Preview")
-    preview_choice = st.selectbox("Preview a file", ["Cleaned Output", "Rearranged Output", "Exception File", "Date Mismatch", "Dedup Log"])
-    preview_map = {
-        "Cleaned Output": "cleaned_output",
-        "Rearranged Output": "rearranged_output",
-        "Exception File": "exception_output",
-        "Date Mismatch": "date_mismatch",
-        "Dedup Log": "dedup_log",
-    }
+    preview_choice = st.selectbox("Preview a file", list(l[0] for l in labels.values()))
+    preview_map = {v[0]: k for k, v in labels.items()}
     st.dataframe(outputs[preview_map[preview_choice]].head(200), use_container_width=True)
+
+    # -----------------------------------------------------------------
+    # Submission history — new capability the registry enables that the
+    # old 3-file-diff model had no equivalent for.
+    # -----------------------------------------------------------------
+    st.subheader("5. Submission History")
+    st.caption(f"Past submissions for {meta['subscriber_code']} ({meta['submission_type']}).")
+    try:
+        history_df = ingestion.get_submission_history(
+            get_cached_engine(), meta["subscriber_code"], meta["submission_type"]
+        )
+        st.dataframe(history_df, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Couldn't load submission history: {e}")
+
 else:
-    st.info("Upload all three files above, then click **Run Pipeline**.")
+    st.info("Upload this month's submission file above, then click **Run Pipeline**.")
