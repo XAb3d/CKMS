@@ -233,6 +233,7 @@ def bulk_insert_raw(engine, df, submission_id, subscriber_id, submission_type, r
     """
     records = []
     identity_json = build_identity_fields_json(df, submission_type)
+
     for i, row in df.iterrows():
         records.append({
             "SubmissionID": submission_id,
@@ -244,7 +245,7 @@ def bulk_insert_raw(engine, df, submission_id, subscriber_id, submission_type, r
             "BranchCode": row.get(config.BRANCH_COL, None),
             "CreditFacilityType": row.get(config.FACILITY_TYPE_COL, None),
             "DisbursementDate": pipeline.parse_date_value(row.get(config.KEY_DATE)),
-            "CurBal": row.get(config.BALANCE_COL, None),
+            "CurBal": pipeline.parse_decimal_value(row.get(config.BALANCE_COL)),
             "ContentHash": row["_ContentHash"],
             "IdentityFieldsJSON": json.dumps(identity_json[i] if i < len(identity_json) else {}),
             "RawPayload": json.dumps(row.drop(labels=["_ContentHash"], errors="ignore").to_dict(), default=str),
