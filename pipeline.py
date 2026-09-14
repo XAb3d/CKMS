@@ -30,9 +30,58 @@ All functions remain pure (DataFrames in, DataFrames out).
 """
 
 import io
+import datetime as _dt
 import pandas as pd
 import numpy as np
 import config
+
+
+def _safe_stringify(value):
+    """
+    Converts an openpyxl-parsed cell value to text WITHOUT going through
+    pandas' default float->str cast, which produces scientific notation for
+    large numbers (e.g. a phone number stored as an Excel "Number" cell
+    becomes "2.33554e+11" instead of the original digits). Whole-number
+    floats are rendered as plain integer digits instead.
+
+    This does NOT recover a leading zero that was already lost because the
+    source cell was genuinely stored as a number in Excel (that information
+    is gone before openpyxl ever sees it) -- it only stops pandas from
+    further mangling the value on top of that.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    if isinstance(value, float):
+        if value == int(value):
+            return str(int(value))
+        return repr(value)  # avoids scientific notation for non-integer floats
+    return str(value).strip()
+
+
+def parse_date_value(value):
+    """
+    Parses a DisbursementDate-style value into a python date object (or
+    None). Source files use compact YYYYMMDD with no separators (e.g.
+    '20260115') -- passing that raw string straight to a SQL DATE column
+    fails ('Invalid character value for cast specification'), since ODBC
+    parameter binding expects either a real date object or 'YYYY-MM-DD',
+    not the compact form. Never raises -- one unparseable date returns None
+    rather than crashing an entire batch insert.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "nat"):
+        return None
+    try:
+        return _dt.datetime.strptime(s, "%Y%m%d").date()
+    except ValueError:
+        pass
+    try:
+        parsed = pd.to_datetime(s, errors="coerce")
+        return parsed.date() if pd.notna(parsed) else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -49,15 +98,27 @@ def load_file(path_or_buffer, submission_type):
 
     name = getattr(path_or_buffer, "name", str(path_or_buffer))
     if str(name).lower().endswith(".csv"):
+        # CSV has no per-cell numeric typing ambiguity -- dtype=str is
+        # reliable here, values are text on disk already.
         df = pd.read_csv(path_or_buffer, dtype=str, keep_default_na=False)
+        for col in force_string_cols:
+            if col in df.columns:
+                df[col] = df[col].fillna("").astype(str).str.strip()
     else:
-        df = pd.read_excel(path_or_buffer, dtype=str)
+        # dtype=str on read_excel does NOT stop openpyxl from parsing a
+        # numeric-formatted cell as float FIRST -- by the time pandas casts
+        # to str, large numbers (phone numbers, IDs stored as Excel
+        # "Number" cells) are already corrupted into scientific notation.
+        # Reading as dtype=object preserves openpyxl's native per-cell type
+        # so we can stringify large numbers safely ourselves.
+        df = pd.read_excel(path_or_buffer, dtype=object)
+        for col in df.columns:
+            if col in force_string_cols:
+                df[col] = df[col].apply(_safe_stringify)
+            else:
+                df[col] = df[col].apply(lambda v: "" if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
 
     df.columns = df.columns.astype(str).str.strip()
-
-    for col in force_string_cols:
-        if col in df.columns:
-            df[col] = df[col].fillna("").astype(str).str.strip()
 
     return df
 
