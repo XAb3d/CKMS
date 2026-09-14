@@ -1,19 +1,32 @@
 """
-CKMS Pipeline — Core Processing Logic
---------------------------------------
-Implements the 8-step monthly data cleaning process:
+CKMS Pipeline — Core Processing Logic (v2)
+--------------------------------------------
+Changes from v1, per design discussion:
 
-1. Deduplicate current-month raw file (3-key, keep lowest balance)
-2. Date-mismatch check (2-key vs previous-month raw)
-3. Composite key match (3-key, working file vs previous-month raw)
-4. Hash comparison on identity/contact fields
-5. Clean-file cross-check (exact matches only, 3-key vs previous-month cleaned)
-6. Build Cleaned Output File
-7. Build Exception Output File
-8. Date-Mismatch Output File (produced in step 2, listed last for output naming)
+  1. Matching/lookup now uses a 4-part IdentityKey (SubscriberCode +
+     SubmissionType + FacilityAccNum + CustomerID) instead of a 3-key that
+     included DisbursementDate. Dedup is UNCHANGED (still 3-key,
+     keep-lowest-balance) -- that's a same-month duplicate-row problem, not
+     a cross-month identity problem, and including date there is correct.
 
-All functions are pure (take DataFrames, return DataFrames) so they can be
-tested independently of the Streamlit UI and swapped/extended later.
+  2. DisbursementDate is no longer part of the content hash. A date change
+     alone can no longer produce a "Different" classification. Date changes
+     are logged to their own informational report (track_date_changes) for
+     every facility type -- never blocks a match, never routes to UNL.
+
+  3. New 'Enriched' classification: a record whose only field differences
+     are ADDED values (blank last month, populated now) is auto-processed
+     like Exact/Rearranged, but keeps its OWN current-month values rather
+     than being overwritten by the carry-forward substitution -- otherwise
+     the new information would be silently discarded. Any record with even
+     one Changed or Removed field is NOT Enriched; it stays in 'Different'
+     and goes to manual review.
+
+  4. IND and BUS have different identity/contact field sets (see config.py),
+     so every function that touches hash fields takes submission_type and
+     looks up the right field list.
+
+All functions remain pure (DataFrames in, DataFrames out).
 """
 
 import io
@@ -26,20 +39,13 @@ import config
 # I/O helpers
 # ---------------------------------------------------------------------------
 
-def load_file(path_or_buffer, force_string_cols=None):
+def load_file(path_or_buffer, submission_type):
     """
     Load a CSV or Excel file. Forces identity/contact/key columns to string
     dtype so leading zeros and long numeric IDs are never mangled.
-
-    IMPORTANT: this does NOT silently create missing columns. A configured
-    field that isn't actually present in the file is a real problem (usually
-    a column-name mismatch between config.py's defaults and this subscriber's
-    actual headers) and must surface as a clear error via validate_columns(),
-    not get quietly papered over with a blank column — that previously
-    caused real identity data to be silently dropped/misrouted without any
-    error at all.
+    submission_type selects which field list ('IND' or 'BUS') to force.
     """
-    force_string_cols = force_string_cols or config.FORCE_STRING_COLS
+    force_string_cols = config.FORCE_STRING_COLS[submission_type]
 
     name = getattr(path_or_buffer, "name", str(path_or_buffer))
     if str(name).lower().endswith(".csv"):
@@ -47,12 +53,8 @@ def load_file(path_or_buffer, force_string_cols=None):
     else:
         df = pd.read_excel(path_or_buffer, dtype=str)
 
-    # Trim whitespace from headers — a common source of "column not found"
-    # errors when a subscriber's file has trailing/leading spaces in headers.
     df.columns = df.columns.astype(str).str.strip()
 
-    # Force known columns to clean string values, but ONLY if they actually
-    # exist. Missing columns are left for validate_columns() to catch loudly.
     for col in force_string_cols:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str).str.strip()
@@ -60,30 +62,7 @@ def load_file(path_or_buffer, force_string_cols=None):
     return df
 
 
-def _concat_cols(df, cols, fields_source=None):
-    """
-    Vectorized pipe-delimited concatenation of columns. Much faster than
-    df.agg(join, axis=1) at scale (avoids a Python-level call per row).
-    """
-    source = fields_source if fields_source is not None else df
-    parts = []
-    for c in cols:
-        if c in source.columns:
-            parts.append(source[c].astype(str))
-        else:
-            parts.append(pd.Series([""] * len(df), index=df.index))
-
-    result = parts[0]
-    for p in parts[1:]:
-        result = result.str.cat(p, sep=config.HASH_DELIMITER)
-    return result
-
-
 def validate_columns(df, required_cols, df_label):
-    """
-    Raises a clear, actionable error if any required column is missing from
-    df, instead of letting a raw KeyError surface deep inside a pipeline step.
-    """
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         available = ", ".join(sorted(df.columns.astype(str)))
@@ -95,24 +74,50 @@ def validate_columns(df, required_cols, df_label):
         )
 
 
+def _concat_cols(df, cols, fields_source=None):
+    source = fields_source if fields_source is not None else df
+    parts = []
+    for c in cols:
+        if c in source.columns:
+            parts.append(source[c].astype(str))
+        else:
+            parts.append(pd.Series([""] * len(df), index=df.index))
+    result = parts[0]
+    for p in parts[1:]:
+        result = result.str.cat(p, sep=config.HASH_DELIMITER)
+    return result
+
+
 def _make_key(df, cols):
-    """Build a pipe-delimited composite key column from the given columns."""
     return _concat_cols(df, cols)
 
 
+def build_identity_key(df, subscriber_code, submission_type,
+                        facility_col=None, customer_col=None):
+    """
+    4-part IdentityKey: SubscriberCode|SubmissionType|FacilityAccNum|CustomerID.
+    subscriber_code/submission_type are constants for the whole file (one
+    subscriber, one type per submission), so broadcast rather than looked up
+    per-row.
+    """
+    facility_col = facility_col or config.KEY_FACILITY
+    customer_col = customer_col or config.KEY_CUSTOMER
+    fac = df[facility_col].astype(str) if facility_col in df.columns else pd.Series([""] * len(df), index=df.index)
+    cust = df[customer_col].astype(str) if customer_col in df.columns else pd.Series([""] * len(df), index=df.index)
+    prefix = f"{subscriber_code}{config.IDENTITY_KEY_DELIMITER}{submission_type}{config.IDENTITY_KEY_DELIMITER}"
+    return prefix + fac.str.cat(cust, sep=config.IDENTITY_KEY_DELIMITER)
+
+
 # ---------------------------------------------------------------------------
-# Step 1: Deduplicate current-month raw file
+# Step 1: Deduplicate current-month raw file — UNCHANGED (3-key, incl. date)
 # ---------------------------------------------------------------------------
 
 def deduplicate(df, key_cols=None, balance_col=None):
     """
-    Deduplicate on the composite key, keeping the row with the LOWEST balance.
-    Ties are broken by first-occurrence in file order (deterministic).
-
-    Returns:
-        deduped_df   - one row per unique key
-        dedup_log_df - every dropped row, with a reason and the key it was
-                       deduplicated on, for audit purposes
+    Same-month duplicate-row detection. Deliberately still 3-key (incl.
+    DisbursementDate): within a single submission, two rows for the same
+    facility+customer with genuinely different dates (e.g. overdraft
+    drawdowns) are real, distinct records and must NOT be collapsed.
     """
     key_cols = key_cols or config.THREE_KEY
     balance_col = balance_col or config.BALANCE_COL
@@ -122,8 +127,6 @@ def deduplicate(df, key_cols=None, balance_col=None):
     df["_CKMS_BAL"] = pd.to_numeric(df[balance_col], errors="coerce")
     df["_CKMS_ORDER"] = range(len(df))
 
-    # Sort so the row we want to KEEP is first within each key group:
-    # lowest balance first, then first-occurrence as tiebreaker.
     df_sorted = df.sort_values(
         by=["_CKMS_KEY", "_CKMS_BAL", "_CKMS_ORDER"],
         ascending=[True, True, True],
@@ -141,126 +144,127 @@ def deduplicate(df, key_cols=None, balance_col=None):
         ).values
         dropped = dropped.rename(columns={"_CKMS_BAL": "This Row Balance"})
 
-    drop_cols = ["_CKMS_ORDER"]
-    kept = kept.drop(columns=drop_cols + ["_CKMS_BAL"], errors="ignore")
+    kept = kept.drop(columns=["_CKMS_ORDER", "_CKMS_BAL"], errors="ignore")
     kept = kept.rename(columns={"_CKMS_KEY": "Composite Key (3-key)"})
 
     if not dropped.empty:
-        dropped = dropped.drop(columns=drop_cols, errors="ignore")
+        dropped = dropped.drop(columns=["_CKMS_ORDER"], errors="ignore")
         dropped = dropped.rename(columns={"_CKMS_KEY": "Composite Key (3-key)"})
 
     return kept.reset_index(drop=True), dropped.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Date-mismatch check (2-key vs previous-month raw)
+# Date tracking — informational only. Never removes rows from the working
+# set, never affects classification. Runs for every facility type.
 # ---------------------------------------------------------------------------
 
-def date_mismatch_check(current_df, previous_raw_df, two_key_cols=None, date_col=None):
+def track_date_changes(current_df, previous_raw_df, identity_key_col="IdentityKey",
+                        date_col=None, facility_type_col=None):
     """
-    Compare 2-key (facility+customer) records against previous-month raw.
-    Where the 2-key matches but the disbursement date differs, pull that
-    record out into its own file.
-
-    Returns:
-        remaining_df       - current_df minus the flagged date-mismatch rows
-        date_mismatch_df   - flagged rows, with old/new date shown side by side
+    Logs every case where DisbursementDate differs from last month's raw
+    record with the same IdentityKey. Returns a log DataFrame only --
+    current_df is NOT filtered or modified. This is DateChangeLog's source.
     """
-    two_key_cols = two_key_cols or config.TWO_KEY
     date_col = date_col or config.KEY_DATE
+    facility_type_col = facility_type_col or config.FACILITY_TYPE_COL
 
     cur = current_df.copy()
     prev = previous_raw_df.copy()
 
-    cur["_CKMS_2KEY"] = _make_key(cur, two_key_cols)
-    prev["_CKMS_2KEY"] = _make_key(prev, two_key_cols)
-
-    # One previous date per 2-key (first occurrence if somehow duplicated)
     prev_dates = (
-        prev.drop_duplicates(subset="_CKMS_2KEY", keep="first")
-        .set_index("_CKMS_2KEY")[date_col]
+        prev.drop_duplicates(subset=identity_key_col, keep="first")
+        .set_index(identity_key_col)[date_col]
     )
+    cur["_PREV_DATE"] = cur[identity_key_col].map(prev_dates)
 
-    cur["_CKMS_PREV_DATE"] = cur["_CKMS_2KEY"].map(prev_dates)
+    has_prev = cur["_PREV_DATE"].notna()
+    date_differs = has_prev & (cur["_PREV_DATE"] != cur[date_col])
 
-    has_prev = cur["_CKMS_PREV_DATE"].notna()
-    date_differs = has_prev & (cur["_CKMS_PREV_DATE"] != cur[date_col])
+    log = cur[date_differs].copy()
+    if not log.empty:
+        cols = [identity_key_col, "_PREV_DATE", date_col]
+        if facility_type_col in log.columns:
+            cols.append(facility_type_col)
+        log = log[cols].rename(columns={
+            "_PREV_DATE": "PreviousDate",
+            date_col: "CurrentDate",
+            facility_type_col: "CreditFacilityType",
+        })
 
-    mismatch = cur[date_differs].copy()
-    remaining = cur[~date_differs].copy()
-
-    if not mismatch.empty:
-        mismatch = mismatch.rename(
-            columns={
-                date_col: "Current Month Disbursement Date",
-                "_CKMS_PREV_DATE": "Previous Month Disbursement Date",
-            }
-        )
-        mismatch["Flag"] = "2-key match, disbursement date differs"
-
-    remaining = remaining.drop(columns=["_CKMS_PREV_DATE"], errors="ignore")
-
-    for d in (mismatch, remaining):
-        if "_CKMS_2KEY" in d.columns:
-            d.rename(columns={"_CKMS_2KEY": "Composite Key (2-key)"}, inplace=True)
-
-    return remaining.reset_index(drop=True), mismatch.reset_index(drop=True)
+    return log.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# Step 3 + 4: Composite key match + hash comparison
+# Field-level diff classification: Added / Changed / Removed
+# ---------------------------------------------------------------------------
+
+def _classify_field_diffs(cur_vals, prev_vals, fields):
+    """
+    For one record, compare current vs previous values field-by-field.
+    Returns (added, changed, removed) — each a list of field names.
+      Added:   prev blank, current has a value
+      Changed: prev had a value, current has a DIFFERENT value
+      Removed: prev had a value, current is blank
+    """
+    added, changed, removed = [], [], []
+    for f in fields:
+        pv = (prev_vals.get(f) or "").strip()
+        cv = (cur_vals.get(f) or "").strip()
+        if pv == cv:
+            continue
+        if pv == "" and cv != "":
+            added.append(f)
+        elif pv != "" and cv == "":
+            removed.append(f)
+        else:
+            changed.append(f)
+    return added, changed, removed
+
+
+# ---------------------------------------------------------------------------
+# Steps 3+4: Identity match + content hash + classification
 # ---------------------------------------------------------------------------
 
 def _row_hash(df, fields):
-    """Vectorized pipe-delimited concatenation of the given fields per row."""
     return _concat_cols(df, fields)
 
 
 def _rearranged_but_same(current_vals, previous_vals):
-    """
-    True only if the group's values were actually reordered (not identical
-    position-for-position) AND the same set of values is present in both.
-    Being unchanged does NOT count as "rearranged".
-    """
     if current_vals == previous_vals:
-        return False  # unchanged, not a rearrangement
+        return False
     cur_set = sorted([v for v in current_vals if v != ""])
     prev_set = sorted([v for v in previous_vals if v != ""])
     return cur_set == prev_set and cur_set != []
 
 
-def match_and_hash(working_df, previous_raw_df, three_key_cols=None,
-                    hash_fields=None, rearrangement_group=None):
+def match_and_hash(working_df, previous_raw_df, submission_type,
+                    identity_key_col="IdentityKey"):
     """
-    Match working_df to previous_raw_df on the 3-key, hash the identity/
-    contact fields, and classify each record.
+    Match on IdentityKey (4-part, date-independent). Classify each record:
 
-    Adds columns:
-        Composite Key (3-key)
-        Match Flag: 'Exact match' | 'Different' | 'No previous-month match'
-        Rearranged: True/False (only meaningful when Match Flag == 'Different')
-        Field Differences: human-readable string of which fields differ
+        Exact match             — content hash identical to last month
+        Rearranged              — same ID values, moved between fields
+        Enriched                — differences exist, but ALL are Added-type
+                                   (no Changed/Removed) — auto-processed,
+                                   keeps CURRENT values (see build note below)
+        Different                — at least one Changed or Removed field —
+                                   needs manual review
+        No previous-month match — IdentityKey not seen last month
     """
-    three_key_cols = three_key_cols or config.THREE_KEY
-    hash_fields = hash_fields or config.ALL_HASH_FIELDS
-    rearrangement_group = rearrangement_group or config.REARRANGEMENT_GROUP
+    hash_fields = config.ALL_HASH_FIELDS[submission_type]
+    rearrangement_group = config.REARRANGEMENT_GROUP[submission_type]
 
     cur = working_df.copy()
     prev = previous_raw_df.copy()
 
-    cur["Composite Key (3-key)"] = _make_key(cur, three_key_cols)
-    prev["Composite Key (3-key)"] = _make_key(prev, three_key_cols)
-
     cur["_CUR_HASH"] = _row_hash(cur, hash_fields)
     prev["_PREV_HASH"] = _row_hash(prev, hash_fields)
 
-    prev_lookup = prev.drop_duplicates(subset="Composite Key (3-key)", keep="first").set_index(
-        "Composite Key (3-key)"
-    )
+    prev_lookup = prev.drop_duplicates(subset=identity_key_col, keep="first").set_index(identity_key_col)
 
-    cur["_PREV_HASH_LOOKUP"] = cur["Composite Key (3-key)"].map(prev_lookup["_PREV_HASH"])
+    cur["_PREV_HASH_LOOKUP"] = cur[identity_key_col].map(prev_lookup["_PREV_HASH"])
 
-    # Vectorized classification (no row-wise apply over the full frame)
     has_prev = cur["_PREV_HASH_LOOKUP"].notna()
     is_same = has_prev & (cur["_CUR_HASH"] == cur["_PREV_HASH_LOOKUP"])
     cur["Match Flag"] = np.select(
@@ -269,33 +273,33 @@ def match_and_hash(working_df, previous_raw_df, three_key_cols=None,
         default="Different",
     )
 
-    # Default columns for every row; only "Different" rows get real values,
-    # and that subset is normally a small fraction of the file.
     cur["Rearranged"] = False
     cur["Field Differences"] = ""
+    cur["Added Fields"] = ""
+    cur["Changed Fields"] = ""
+    cur["Removed Fields"] = ""
 
     diff_mask = cur["Match Flag"] == "Different"
     n_diff = int(diff_mask.sum())
 
     if n_diff > 0:
-        diff_subset = cur.loc[diff_mask, ["Composite Key (3-key)"] + hash_fields].copy()
+        diff_subset = cur.loc[diff_mask, [identity_key_col] + hash_fields].copy()
 
-        # Vectorized per-field previous-value lookup for just this subset
         prev_field_vals = {}
         for f in hash_fields:
             if f in prev_lookup.columns:
-                prev_field_vals[f] = diff_subset["Composite Key (3-key)"].map(prev_lookup[f]).fillna("")
+                prev_field_vals[f] = diff_subset[identity_key_col].map(prev_lookup[f]).fillna("")
             else:
                 prev_field_vals[f] = pd.Series([""] * len(diff_subset), index=diff_subset.index)
 
-        # Per-field diff boolean matrix (vectorized column-by-column, not row-by-row)
         field_diff_bool = pd.DataFrame(
             {f: diff_subset[f].astype(str) != prev_field_vals[f].astype(str) for f in hash_fields},
             index=diff_subset.index,
         )
 
-        diff_strings = []
-        rearranged_vals = []
+        diff_strings, rearranged_vals = [], []
+        added_strs, changed_strs, removed_strs = [], [], []
+
         for idx in diff_subset.index:
             diffing_fields = [f for f in hash_fields if field_diff_bool.at[idx, f]]
             diffs = [
@@ -303,6 +307,13 @@ def match_and_hash(working_df, previous_raw_df, three_key_cols=None,
                 for f in diffing_fields
             ]
             diff_strings.append("; ".join(diffs))
+
+            cur_vals = {f: diff_subset.at[idx, f] for f in hash_fields}
+            prev_vals = {f: prev_field_vals[f].loc[idx] for f in hash_fields}
+            added, changed, removed = _classify_field_diffs(cur_vals, prev_vals, diffing_fields)
+            added_strs.append(", ".join(added))
+            changed_strs.append(", ".join(changed))
+            removed_strs.append(", ".join(removed))
 
             all_diffs_in_group = len(diffing_fields) > 0 and all(f in rearrangement_group for f in diffing_fields)
             if all_diffs_in_group:
@@ -314,84 +325,104 @@ def match_and_hash(working_df, previous_raw_df, three_key_cols=None,
 
         cur.loc[diff_mask, "Field Differences"] = diff_strings
         cur.loc[diff_mask, "Rearranged"] = rearranged_vals
+        cur.loc[diff_mask, "Added Fields"] = added_strs
+        cur.loc[diff_mask, "Changed Fields"] = changed_strs
+        cur.loc[diff_mask, "Removed Fields"] = removed_strs
+
+    # Enriched: classified as "Different" but has Added fields only, no
+    # Changed/Removed, and is not already claimed by Rearranged.
+    is_enriched = (
+        (cur["Match Flag"] == "Different")
+        & (~cur["Rearranged"])
+        & (cur["Added Fields"] != "")
+        & (cur["Changed Fields"] == "")
+        & (cur["Removed Fields"] == "")
+    )
+    cur.loc[is_enriched, "Match Flag"] = "Enriched"
 
     cur = cur.drop(columns=["_CUR_HASH", "_PREV_HASH_LOOKUP"], errors="ignore")
     return cur.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Clean-file cross-check
+# Step 5: Clean-file cross-check (keyed on IdentityKey now, not 3-key)
 # ---------------------------------------------------------------------------
 
-def clean_file_cross_check(subset_df, previous_clean_df, three_key_cols=None, not_found_label="Not found in cleaned file"):
-    """
-    For a given subset of matched records (exact matches OR provable
-    rearrangements — anything considered safe to carry forward), check
-    whether the 3-key exists in the previous-month cleaned file.
-
-    Returns:
-        eligible_df   - found in the clean file (ready to carry forward)
-        not_found_df  - NOT found in the clean file (goes to exceptions)
-    """
-    three_key_cols = three_key_cols or config.THREE_KEY
-
-    clean = previous_clean_df.copy()
-    clean["Composite Key (3-key)"] = _make_key(clean, three_key_cols)
-    clean_keys = set(clean["Composite Key (3-key)"])
-
+def clean_file_cross_check(subset_df, previous_clean_df, identity_key_col="IdentityKey",
+                            not_found_label="Not found in cleaned file"):
+    clean_keys = set(previous_clean_df[identity_key_col])
     subset_df = subset_df.copy()
-    found_mask = subset_df["Composite Key (3-key)"].isin(clean_keys)
+    found_mask = subset_df[identity_key_col].isin(clean_keys)
     eligible = subset_df[found_mask].copy()
     not_found = subset_df[~found_mask].copy()
-
     if not not_found.empty:
         not_found["Exception Category"] = not_found_label
-
     return eligible.reset_index(drop=True), not_found.reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Step 6: Build Cleaned Output File
-# ---------------------------------------------------------------------------
-
-def build_cleaned_output(eligible_df, previous_clean_df, three_key_cols=None, hash_fields=None):
+def check_previously_unl(not_found_df, previous_unl_df, identity_key_col="IdentityKey"):
     """
-    For each eligible record, copy the full current-month row and replace
-    only the identity/contact fields with values from the previous-month
-    cleaned file. All other current-month fields are left untouched.
+    Sharpens the vague 'not found in cleaned file' case: if the IdentityKey
+    also appears in a PRIOR unresolved UNL record, this isn't a new problem
+    -- it's a known carry-over that was never resolved. Split accordingly so
+    triage can tell the two apart immediately.
     """
-    three_key_cols = three_key_cols or config.THREE_KEY
-    hash_fields = hash_fields or config.ALL_HASH_FIELDS
+    if not_found_df.empty or previous_unl_df.empty:
+        return not_found_df.copy(), pd.DataFrame()
 
-    clean = previous_clean_df.copy()
-    clean["Composite Key (3-key)"] = _make_key(clean, three_key_cols)
-    clean_lookup = clean.drop_duplicates(subset="Composite Key (3-key)", keep="first").set_index(
-        "Composite Key (3-key)"
+    prior_unresolved_keys = set(
+        previous_unl_df.loc[previous_unl_df.get("Resolved", 0) == 0, identity_key_col]
     )
+    is_carryover = not_found_df[identity_key_col].isin(prior_unresolved_keys)
+
+    carryover = not_found_df[is_carryover].copy()
+    genuinely_new = not_found_df[~is_carryover].copy()
+
+    if not carryover.empty:
+        carryover["Exception Category"] = (
+            "Matched in Raw History - Previously Routed to UNL, Never Resolved in Clean"
+        )
+
+    return genuinely_new.reset_index(drop=True), carryover.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Step 6: Build outputs
+# ---------------------------------------------------------------------------
+
+def build_carry_forward_output(eligible_df, previous_clean_df, submission_type,
+                                identity_key_col="IdentityKey"):
+    """
+    For Exact/Rearranged records: overwrite hash fields with the PREVIOUS
+    clean values (this is the whole point -- carry forward what was already
+    verified clean). Does NOT touch DisbursementDate or any other raw field.
+    """
+    hash_fields = config.ALL_HASH_FIELDS[submission_type]
+    clean_lookup = previous_clean_df.drop_duplicates(subset=identity_key_col, keep="first").set_index(identity_key_col)
 
     out = eligible_df.copy()
     for f in hash_fields:
         if f in clean_lookup.columns:
-            out[f] = out["Composite Key (3-key)"].map(clean_lookup[f]).fillna(out.get(f, ""))
+            out[f] = out[identity_key_col].map(clean_lookup[f]).fillna(out.get(f, ""))
 
     out["Source"] = "Carried forward from previous cleaned file"
     return out.reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Step 7: Build Exception Output File
-# ---------------------------------------------------------------------------
+def build_enriched_output(enriched_df):
+    """
+    For Enriched records: do NOT overwrite with previous clean values --
+    that would discard the newly-added information. Current-month values
+    are kept exactly as submitted; only the Source label marks how this
+    record was auto-resolved.
+    """
+    out = enriched_df.copy()
+    out["Source"] = "Auto-processed: new identity data added, no conflicts"
+    return out.reset_index(drop=True)
 
-def build_exception_output(true_different_df, no_match_df, not_found_exact_df, not_found_rearranged_df):
-    """
-    Combine everything that still needs a human look into one labeled file:
-      - true 'Different hash' (real changes, NOT provable rearrangements)
-      - 'No previous-month match'
-      - 'Same hash, not found in cleaned file' (exact match, no clean record)
-      - 'Rearranged, not found in cleaned file' (rearranged, no clean record)
-    Provable rearrangements that DID find a clean-file match are handled
-    separately — see build_cleaned_output / the rearranged output file.
-    """
+
+def build_unl_output(true_different_df, no_match_df, not_found_exact_df,
+                      not_found_rearranged_df, previously_unl_carryover_df=None):
     frames = []
 
     if true_different_df is not None and not true_different_df.empty:
@@ -410,6 +441,9 @@ def build_exception_output(true_different_df, no_match_df, not_found_exact_df, n
     if not_found_rearranged_df is not None and not not_found_rearranged_df.empty:
         frames.append(not_found_rearranged_df)
 
+    if previously_unl_carryover_df is not None and not previously_unl_carryover_df.empty:
+        frames.append(previously_unl_carryover_df)
+
     if not frames:
         return pd.DataFrame()
 
@@ -423,17 +457,18 @@ def build_exception_output(true_different_df, no_match_df, not_found_exact_df, n
 def build_workbook(outputs, summary=None):
     """
     Bundle all output DataFrames into a single .xlsx workbook, one sheet per
-    category, with a Summary sheet first. Uses xlsxwriter in constant_memory
-    mode so it stays fast/lightweight even at 100-150K+ rows per sheet.
+    category, with a Summary sheet first. Uses xlsxwriter so it stays
+    fast/lightweight even at 100-150K+ rows per sheet.
 
     Returns raw bytes, ready for a Streamlit download_button.
     """
     sheet_names = {
         "dedup_log": "Dedup Log",
-        "date_mismatch": "Date Mismatch",
+        "date_change_log": "Date Changes (Info)",
         "cleaned_output": "Cleaned Output",
         "rearranged_output": "Rearranged (Auto)",
-        "exception_output": "Exception File",
+        "enriched_output": "Enriched (Auto)",
+        "unl_output": "UNL",
     }
 
     buffer = io.BytesIO()
@@ -448,90 +483,94 @@ def build_workbook(outputs, summary=None):
 
         for key, sheet_name in sheet_names.items():
             df = outputs.get(key)
-            if df is None or df.empty:
-                # Still create the sheet, with headers if available, so the
-                # workbook's tab list matches expectations even when a
-                # category had zero rows this run.
-                (df if df is not None else pd.DataFrame()).to_excel(
-                    writer, sheet_name=sheet_name, index=False
-                )
-            else:
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
+            (df if df is not None else pd.DataFrame()).to_excel(
+                writer, sheet_name=sheet_name, index=False
+            )
 
     buffer.seek(0)
     return buffer.getvalue()
 
 
-def run_pipeline(current_raw_df, previous_raw_df, previous_clean_df):
+def run_pipeline(current_raw_df, previous_raw_df, previous_clean_df, submission_type,
+                  previous_unl_df=None):
     """
-    Runs the full pipeline and returns a dict of output DataFrames plus a
-    summary of counts at each stage.
-
-    Output files:
-        dedup_log         - duplicates removed
-        date_mismatch      - 2-key match, disbursement date differs
-        cleaned_output      - exact matches, carried forward from clean file
-        rearranged_output   - provable rearrangements, auto-processed and
-                              carried forward from clean file (own file, for
-                              transparency/audit — not silently merged into
-                              cleaned_output)
-        exception_output    - everything still needing a human look
+    Runs one submission through the full pipeline against registry-sourced
+    previous-period data (previous_raw_df/previous_clean_df/previous_unl_df
+    are expected to already be filtered to the prior ReportingPeriod +
+    SubmissionType by the caller/ingestion layer, and all three -- plus
+    current_raw_df -- must already have an 'IdentityKey' column).
     """
     summary = {}
+    previous_unl_df = previous_unl_df if previous_unl_df is not None else pd.DataFrame()
 
-    # Step 1
+    # Step 1 — dedup (unchanged, 3-key)
     deduped_df, dedup_log_df = deduplicate(current_raw_df)
     summary["Input records"] = len(current_raw_df)
     summary["Duplicates removed"] = len(dedup_log_df)
     summary["After dedup"] = len(deduped_df)
 
-    # Step 2
-    working_df, date_mismatch_df = date_mismatch_check(deduped_df, previous_raw_df)
-    summary["Date mismatches pulled out"] = len(date_mismatch_df)
-    summary["Working set"] = len(working_df)
+    # Date tracking — informational only, does not filter working set
+    date_change_log_df = track_date_changes(deduped_df, previous_raw_df)
+    summary["Date changes logged (informational)"] = len(date_change_log_df)
 
-    # Step 3 + 4
-    matched_df = match_and_hash(working_df, previous_raw_df)
+    working_df = deduped_df  # nothing removed for date reasons
+
+    # Steps 3+4 — match + classify
+    matched_df = match_and_hash(working_df, previous_raw_df, submission_type)
 
     exact_df = matched_df[matched_df["Match Flag"] == "Exact match"].copy()
-    rearranged_df = matched_df[(matched_df["Match Flag"] == "Different") & (matched_df["Rearranged"])].copy()
-    true_different_df = matched_df[(matched_df["Match Flag"] == "Different") & (~matched_df["Rearranged"])].copy()
+    rearranged_df = matched_df[matched_df["Match Flag"] == "Rearranged"].copy()
+    enriched_df = matched_df[matched_df["Match Flag"] == "Enriched"].copy()
+    true_different_df = matched_df[matched_df["Match Flag"] == "Different"].copy()
     no_match_df = matched_df[matched_df["Match Flag"] == "No previous-month match"].copy()
 
     summary["Exact match"] = len(exact_df)
     summary["Rearranged (auto-processed)"] = len(rearranged_df)
-    summary["Different (real change)"] = len(true_different_df)
+    summary["Enriched (auto-processed)"] = len(enriched_df)
+    summary["Different (needs review)"] = len(true_different_df)
     summary["No previous-month match"] = len(no_match_df)
 
-    # Step 5 — run the clean-file cross-check for both exact and rearranged
+    # Step 5 — clean-file cross-check for Exact + Rearranged
+    # (Enriched skips this: it never had prior clean data to reconcile
+    # against in the way Exact/Rearranged do; it is auto-published as-is.)
     eligible_exact_df, not_found_exact_df = clean_file_cross_check(
         exact_df, previous_clean_df, not_found_label="Same hash, not found in cleaned file"
     )
     eligible_rearranged_df, not_found_rearranged_df = clean_file_cross_check(
         rearranged_df, previous_clean_df, not_found_label="Rearranged, not found in cleaned file"
     )
+
+    # Sharpen "not found" into genuinely-new vs known-carryover-from-UNL
+    not_found_exact_df, carryover_exact_df = check_previously_unl(not_found_exact_df, previous_unl_df)
+    not_found_rearranged_df, carryover_rearranged_df = check_previously_unl(not_found_rearranged_df, previous_unl_df)
+    carryover_df = pd.concat([carryover_exact_df, carryover_rearranged_df], ignore_index=True, sort=False) \
+        if not (carryover_exact_df.empty and carryover_rearranged_df.empty) else pd.DataFrame()
+
     summary["Eligible for carry-forward (exact)"] = len(eligible_exact_df)
     summary["Eligible for carry-forward (rearranged)"] = len(eligible_rearranged_df)
     summary["Same hash, not found in cleaned file"] = len(not_found_exact_df)
     summary["Rearranged, not found in cleaned file"] = len(not_found_rearranged_df)
+    summary["Previously UNL'd, still unresolved (carryover)"] = len(carryover_df)
 
-    # Step 6 — two carry-forward outputs, kept separate for audit clarity
-    cleaned_output_df = build_cleaned_output(eligible_exact_df, previous_clean_df)
-    rearranged_output_df = build_cleaned_output(eligible_rearranged_df, previous_clean_df)
+    # Step 6 — build outputs
+    cleaned_output_df = build_carry_forward_output(eligible_exact_df, previous_clean_df, submission_type)
+    rearranged_output_df = build_carry_forward_output(eligible_rearranged_df, previous_clean_df, submission_type)
     if not rearranged_output_df.empty:
         rearranged_output_df["Source"] = "Auto-processed: same ID values, different field order"
+    enriched_output_df = build_enriched_output(enriched_df)
 
-    # Step 7
-    exception_output_df = build_exception_output(
-        true_different_df, no_match_df, not_found_exact_df, not_found_rearranged_df
+    # Step 7 — UNL output
+    unl_output_df = build_unl_output(
+        true_different_df, no_match_df, not_found_exact_df, not_found_rearranged_df, carryover_df
     )
 
     outputs = {
         "dedup_log": dedup_log_df,
-        "date_mismatch": date_mismatch_df,
+        "date_change_log": date_change_log_df,          # informational only
         "cleaned_output": cleaned_output_df,
         "rearranged_output": rearranged_output_df,
-        "exception_output": exception_output_df,
+        "enriched_output": enriched_output_df,           # new
+        "unl_output": unl_output_df,
     }
 
     return outputs, summary
