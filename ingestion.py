@@ -45,8 +45,8 @@ import pipeline
 #   python3 -c "import pyodbc; print(pyodbc.drivers())"
 # and use whichever "...for SQL Server" entry appears in that list.
 # ---------------------------------------------------------------------------
-SQL_SERVER_INSTANCE = r'.\AB3EXPRESS'
-SQL_DATABASE_NAME = "CKMS-NEW"          # <-- confirm/replace with your actual DB name
+SQL_SERVER_INSTANCE = r"AB3K33\AB3EXPRESS"
+SQL_DATABASE_NAME = "CKMS_Registry"          # <-- confirm/replace with your actual DB name
 SQL_ODBC_DRIVER = "ODBC Driver 17 for SQL Server"
 
 _odbc_connect_str = (
@@ -243,7 +243,7 @@ def bulk_insert_raw(engine, df, submission_id, subscriber_id, submission_type, r
             "CustomerID": row.get(config.KEY_CUSTOMER, ""),
             "BranchCode": row.get(config.BRANCH_COL, None),
             "CreditFacilityType": row.get(config.FACILITY_TYPE_COL, None),
-            "DisbursementDate": row.get(config.KEY_DATE, None) or None,
+            "DisbursementDate": pipeline.parse_date_value(row.get(config.KEY_DATE)),
             "CurBal": row.get(config.BALANCE_COL, None),
             "ContentHash": row["_ContentHash"],
             "IdentityFieldsJSON": json.dumps(identity_json[i] if i < len(identity_json) else {}),
@@ -286,8 +286,8 @@ def write_date_change_log(engine, date_change_log_df):
                 """INSERT INTO DateChangeLog
                    (IdentityKey, ReportingPeriod, PreviousDate, CurrentDate, CreditFacilityType)
                    VALUES (?, ?, ?, ?, ?)""",
-                (r["IdentityKey"], r.get("ReportingPeriod", ""), r.get("PreviousDate", None),
-                 r.get("CurrentDate", None), r.get("CreditFacilityType", None)),
+                (r["IdentityKey"], r.get("ReportingPeriod", ""), pipeline.parse_date_value(r.get("PreviousDate")),
+                 pipeline.parse_date_value(r.get("CurrentDate")), r.get("CreditFacilityType", None)),
             )
 
 
