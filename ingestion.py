@@ -142,31 +142,29 @@ def build_identity_fields_json(df, submission_type):
 # Registry reads
 # ---------------------------------------------------------------------------
 
-def get_or_create_subscriber(engine, subscriber_code):
-    with engine.begin() as conn:
-        row = conn.exec_driver_sql(
-            "SELECT SubscriberID FROM Subscribers WHERE SubscriberCode = ?", (subscriber_code,)
-        ).fetchone()
-        if row:
-            return row[0]
-        result = conn.exec_driver_sql(
-            "INSERT INTO Subscribers (SubscriberCode) OUTPUT INSERTED.SubscriberID VALUES (?)",
-            (subscriber_code,),
-        )
-        return result.fetchone()[0]
+def get_or_create_subscriber(conn, subscriber_code):
+    row = conn.exec_driver_sql(
+        "SELECT SubscriberID FROM Subscribers WHERE SubscriberCode = ?", (subscriber_code,)
+    ).fetchone()
+    if row:
+        return row[0]
+    result = conn.exec_driver_sql(
+        "INSERT INTO Subscribers (SubscriberCode) OUTPUT INSERTED.SubscriberID VALUES (?)",
+        (subscriber_code,),
+    )
+    return result.fetchone()[0]
 
 
-def create_submission(engine, subscriber_id, meta, row_count):
-    with engine.begin() as conn:
-        result = conn.exec_driver_sql(
-            """INSERT INTO Submissions
-               (SubscriberID, ReportingPeriod, SubmissionType, SequenceNumber, FileName, RecordCount)
-               OUTPUT INSERTED.SubmissionID
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (subscriber_id, meta["reporting_period"], meta["submission_type"],
-             meta["sequence_number"], meta.get("filename", ""), row_count),
-        )
-        return result.fetchone()[0]
+def create_submission(conn, subscriber_id, meta, row_count):
+    result = conn.exec_driver_sql(
+        """INSERT INTO Submissions
+           (SubscriberID, ReportingPeriod, SubmissionType, SequenceNumber, FileName, RecordCount)
+           OUTPUT INSERTED.SubmissionID
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (subscriber_id, meta["reporting_period"], meta["submission_type"],
+         meta["sequence_number"], meta.get("filename", ""), row_count),
+    )
+    return result.fetchone()[0]
 
 
 def previous_period(reporting_period):
@@ -176,12 +174,16 @@ def previous_period(reporting_period):
     return f"{y:04d}-{m - 1:02d}"
 
 
-def load_previous_registry_data(engine, subscriber_id, submission_type, reporting_period):
+def load_previous_registry_data(conn, subscriber_id, submission_type, reporting_period):
     """
     Pulls the PRIOR period's raw/clean/unl rows for this subscriber+type,
     reconstituting the flat columns match_and_hash()/track_date_changes()
     need from IdentityFieldsJSON. This is the direct replacement for
     uploading 'previous month raw file' / 'previous month cleaned file'.
+    Reads through the SAME connection/transaction as the rest of
+    process_file() -- prior periods are already committed from earlier
+    runs, so this doesn't depend on that, but keeping one connection for
+    the whole call avoids opening multiple pool connections per file.
     """
     prev_period = previous_period(reporting_period)
 
@@ -191,7 +193,7 @@ def load_previous_registry_data(engine, subscriber_id, submission_type, reportin
            FROM MasterRawRegistry
            WHERE SubscriberID = ? AND SubmissionType = ? AND ReportingPeriod = ?
              AND IsDuplicate = 0""",
-        engine, params=(subscriber_id, submission_type, prev_period),
+        conn, params=(subscriber_id, submission_type, prev_period),
     )
     if not prev_raw.empty:
         expanded = pd.json_normalize(prev_raw["IdentityFieldsJSON"].apply(json.loads))
@@ -201,7 +203,7 @@ def load_previous_registry_data(engine, subscriber_id, submission_type, reportin
         """SELECT IdentityKey, IdentityFieldsJSON
            FROM MasterCleanRegistry
            WHERE ReportingPeriod = ? AND IdentityKey LIKE ?""",
-        engine, params=(prev_period, f"{subscriber_id}|{submission_type}|%"),
+        conn, params=(prev_period, f"{subscriber_id}|{submission_type}|%"),
     )
     if not prev_clean.empty:
         expanded = pd.json_normalize(prev_clean["IdentityFieldsJSON"].apply(json.loads))
@@ -215,7 +217,7 @@ def load_previous_registry_data(engine, subscriber_id, submission_type, reportin
     prev_unl = pd.read_sql(
         """SELECT IdentityKey, Resolved FROM MasterUNLRegistry
            WHERE IdentityKey LIKE ? AND Resolved = 0""",
-        engine, params=(f"{subscriber_id}|{submission_type}|%",),
+        conn, params=(f"{subscriber_id}|{submission_type}|%",),
     )
 
     return prev_raw, prev_clean, prev_unl
@@ -225,7 +227,7 @@ def load_previous_registry_data(engine, subscriber_id, submission_type, reportin
 # Registry writes
 # ---------------------------------------------------------------------------
 
-def bulk_insert_raw(engine, df, submission_id, subscriber_id, submission_type, reporting_period):
+def bulk_insert_raw(conn, df, submission_id, subscriber_id, submission_type, reporting_period):
     """
     Bulk insert into MasterRawRegistry using fast_executemany. At 70-150k
     rows/file (confirmed volume), row-by-row executemany would be far too
@@ -252,79 +254,76 @@ def bulk_insert_raw(engine, df, submission_id, subscriber_id, submission_type, r
         })
 
     out_df = pd.DataFrame(records)
-    with engine.begin() as conn:
-        out_df.to_sql("MasterRawRegistry", conn, if_exists="append", index=False, method="multi", chunksize=1000)
+    out_df.to_sql("MasterRawRegistry", conn, if_exists="append", index=False, method="multi", chunksize=1000)
 
     # Pull back RawRecordIDs for this submission so downstream steps (dedup
-    # marking, clean/unl writes) can reference them.
+    # marking, clean/unl writes) can reference them. Reading through the
+    # SAME connection/transaction, so this sees the rows just inserted
+    # above even though nothing has committed yet.
     return pd.read_sql(
         "SELECT RawRecordID, IdentityKey, ContentHash FROM MasterRawRegistry WHERE SubmissionID = ?",
-        engine, params=(submission_id,),
+        conn, params=(submission_id,),
     )
 
 
-def mark_duplicates(engine, dedup_log_df, raw_ids_df):
+def mark_duplicates(conn, dedup_log_df, raw_ids_df):
     if dedup_log_df.empty:
         return
-    with engine.begin() as conn:
-        for _, r in dedup_log_df.iterrows():
-            conn.exec_driver_sql(
-                """UPDATE MasterRawRegistry SET IsDuplicate = 1, DedupReason = ?
-                   WHERE RawRecordID IN (
-                       SELECT RawRecordID FROM MasterRawRegistry
-                       WHERE IdentityKey = ? AND ContentHash = ?
-                   )""",
-                (r["Dedup Reason"], r.get("IdentityKey", ""), r.get("_ContentHash", "")),
-            )
+    for _, r in dedup_log_df.iterrows():
+        conn.exec_driver_sql(
+            """UPDATE MasterRawRegistry SET IsDuplicate = 1, DedupReason = ?
+               WHERE RawRecordID IN (
+                   SELECT RawRecordID FROM MasterRawRegistry
+                   WHERE IdentityKey = ? AND ContentHash = ?
+               )""",
+            (r["Dedup Reason"], r.get("IdentityKey", ""), r.get("_ContentHash", "")),
+        )
 
 
-def write_date_change_log(engine, date_change_log_df):
+def write_date_change_log(conn, date_change_log_df):
     if date_change_log_df.empty:
         return
-    with engine.begin() as conn:
-        for _, r in date_change_log_df.iterrows():
-            conn.exec_driver_sql(
-                """INSERT INTO DateChangeLog
-                   (IdentityKey, ReportingPeriod, PreviousDate, CurrentDate, CreditFacilityType)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (r["IdentityKey"], r.get("ReportingPeriod", ""), pipeline.parse_date_value(r.get("PreviousDate")),
-                 pipeline.parse_date_value(r.get("CurrentDate")), r.get("CreditFacilityType", None)),
-            )
+    for _, r in date_change_log_df.iterrows():
+        conn.exec_driver_sql(
+            """INSERT INTO DateChangeLog
+               (IdentityKey, ReportingPeriod, PreviousDate, CurrentDate, CreditFacilityType)
+               VALUES (?, ?, ?, ?, ?)""",
+            (r["IdentityKey"], r.get("ReportingPeriod", ""), pipeline.parse_date_value(r.get("PreviousDate")),
+             pipeline.parse_date_value(r.get("CurrentDate")), r.get("CreditFacilityType", None)),
+        )
 
 
-def upsert_clean_registry(engine, df, submission_type, reporting_period, match_category):
+def upsert_clean_registry(conn, df, submission_type, reporting_period, match_category):
     if df.empty:
         return
     hash_fields = config.ALL_HASH_FIELDS[submission_type]
-    with engine.begin() as conn:
-        for _, r in df.iterrows():
-            payload = json.dumps({f: r.get(f, "") for f in hash_fields})
-            conn.exec_driver_sql(
-                """MERGE MasterCleanRegistry AS tgt
-                   USING (SELECT ? AS IdentityKey, ? AS ReportingPeriod) AS src
-                   ON tgt.IdentityKey = src.IdentityKey AND tgt.ReportingPeriod = src.ReportingPeriod
-                   WHEN MATCHED THEN UPDATE SET IdentityFieldsJSON = ?, MatchCategory = ?
-                   WHEN NOT MATCHED THEN INSERT (IdentityKey, SubmissionType, ReportingPeriod,
-                        SourceRawRecordID, IdentityFieldsJSON, MatchCategory)
-                        VALUES (?, ?, ?, ?, ?, ?);""",
-                (r["IdentityKey"], reporting_period, payload, match_category,
-                 r["IdentityKey"], submission_type, reporting_period,
-                 r.get("RawRecordID"), payload, match_category),
-            )
+    for _, r in df.iterrows():
+        payload = json.dumps({f: r.get(f, "") for f in hash_fields})
+        conn.exec_driver_sql(
+            """MERGE MasterCleanRegistry AS tgt
+               USING (SELECT ? AS IdentityKey, ? AS ReportingPeriod) AS src
+               ON tgt.IdentityKey = src.IdentityKey AND tgt.ReportingPeriod = src.ReportingPeriod
+               WHEN MATCHED THEN UPDATE SET IdentityFieldsJSON = ?, MatchCategory = ?
+               WHEN NOT MATCHED THEN INSERT (IdentityKey, SubmissionType, ReportingPeriod,
+                    SourceRawRecordID, IdentityFieldsJSON, MatchCategory)
+                    VALUES (?, ?, ?, ?, ?, ?);""",
+            (r["IdentityKey"], reporting_period, payload, match_category,
+             r["IdentityKey"], submission_type, reporting_period,
+             r.get("RawRecordID"), payload, match_category),
+        )
 
 
-def write_unl(engine, unl_df):
+def write_unl(conn, unl_df):
     if unl_df.empty:
         return
-    with engine.begin() as conn:
-        for _, r in unl_df.iterrows():
-            conn.exec_driver_sql(
-                """INSERT INTO MasterUNLRegistry
-                   (RawRecordID, IdentityKey, ReportingPeriod, ExceptionCategory, Details)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (r.get("RawRecordID"), r["IdentityKey"], r.get("ReportingPeriod", ""),
-                 r["Exception Category"], r.get("Field Differences", None)),
-            )
+    for _, r in unl_df.iterrows():
+        conn.exec_driver_sql(
+            """INSERT INTO MasterUNLRegistry
+               (RawRecordID, IdentityKey, ReportingPeriod, ExceptionCategory, Details)
+               VALUES (?, ?, ?, ?, ?)""",
+            (r.get("RawRecordID"), r["IdentityKey"], r.get("ReportingPeriod", ""),
+             r["Exception Category"], r.get("Field Differences", None)),
+        )
 
 
 def get_submission_history(engine, subscriber_code, submission_type=None, limit=24):
@@ -356,16 +355,28 @@ def get_submission_history(engine, subscriber_code, submission_type=None, limit=
 
 def process_file(engine, file_path_or_buffer, filename):
     """
-    engine is now passed in rather than created here -- a caller running many
+    engine is passed in rather than created here -- a caller running many
     uploads in one session (e.g. the Streamlit app) should create ONE engine
     (cached) and reuse it, rather than opening a new connection pool per file.
+
+    Everything from the subscriber lookup through the final UNL write runs
+    inside ONE transaction (single `with engine.begin()` block below). This
+    matters for the backfill/resume checkpoint (already_processed(), which
+    checks for a Submissions row): if a failure partway through used to
+    leave an already-committed Submissions row with no actual data behind
+    it, the checkpoint would wrongly treat that file as done on retry. With
+    one transaction, either the ENTIRE file's processing commits together --
+    Submissions row, raw rows, dedup marks, clean/unl writes, all of it --
+    or a failure anywhere rolls back everything, leaving nothing behind to
+    falsely check as "already loaded."
     """
     meta = parse_filename(filename)
     meta["filename"] = filename
-
-    subscriber_id = get_or_create_subscriber(engine, meta["subscriber_code"])
     submission_type = meta["submission_type"]
 
+    # Loading, validating, normalizing, and hashing the file is pure
+    # Python/pandas work with no DB dependency -- fine to do before opening
+    # the transaction.
     df = pipeline.load_file(file_path_or_buffer, submission_type)
     required = list(dict.fromkeys(
         config.THREE_KEY + config.ALL_HASH_FIELDS[submission_type] + [config.BALANCE_COL]
@@ -376,20 +387,25 @@ def process_file(engine, file_path_or_buffer, filename):
     df["IdentityKey"] = pipeline.build_identity_key(df, meta["subscriber_code"], submission_type)
     df["_ContentHash"] = compute_content_hash(df, submission_type)
 
-    submission_id = create_submission(engine, subscriber_id, meta, len(df))
-    raw_ids = bulk_insert_raw(engine, df, submission_id, subscriber_id, submission_type, meta["reporting_period"])
+    with engine.begin() as conn:
+        subscriber_id = get_or_create_subscriber(conn, meta["subscriber_code"])
+        submission_id = create_submission(conn, subscriber_id, meta, len(df))
+        raw_ids = bulk_insert_raw(conn, df, submission_id, subscriber_id, submission_type, meta["reporting_period"])
 
-    prev_raw, prev_clean, prev_unl = load_previous_registry_data(
-        engine, subscriber_id, submission_type, meta["reporting_period"]
-    )
+        prev_raw, prev_clean, prev_unl = load_previous_registry_data(
+            conn, subscriber_id, submission_type, meta["reporting_period"]
+        )
 
-    outputs, summary = pipeline.run_pipeline(df, prev_raw, prev_clean, submission_type, prev_unl)
+        outputs, summary = pipeline.run_pipeline(df, prev_raw, prev_clean, submission_type, prev_unl)
 
-    mark_duplicates(engine, outputs["dedup_log"], raw_ids)
-    write_date_change_log(engine, outputs["date_change_log"])
-    upsert_clean_registry(engine, outputs["cleaned_output"], submission_type, meta["reporting_period"], "Exact")
-    upsert_clean_registry(engine, outputs["rearranged_output"], submission_type, meta["reporting_period"], "Rearranged")
-    upsert_clean_registry(engine, outputs["enriched_output"], submission_type, meta["reporting_period"], "Enriched")
-    write_unl(engine, outputs["unl_output"])
+        mark_duplicates(conn, outputs["dedup_log"], raw_ids)
+        write_date_change_log(conn, outputs["date_change_log"])
+        upsert_clean_registry(conn, outputs["cleaned_output"], submission_type, meta["reporting_period"], "Exact")
+        upsert_clean_registry(conn, outputs["rearranged_output"], submission_type, meta["reporting_period"], "Rearranged")
+        upsert_clean_registry(conn, outputs["enriched_output"], submission_type, meta["reporting_period"], "Enriched")
+        write_unl(conn, outputs["unl_output"])
+        # Reaching here without an exception means every step above
+        # succeeded -- `with engine.begin()` commits on clean exit. Any
+        # exception anywhere above rolls back the WHOLE block instead.
 
     return outputs, summary, meta
