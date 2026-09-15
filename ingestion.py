@@ -19,6 +19,7 @@ database (confirmed — merge is a future build, not this one).
 import re
 import os
 import json
+import uuid
 import hashlib
 import urllib.parse
 
@@ -232,10 +233,25 @@ def bulk_insert_raw(conn, df, submission_id, subscriber_id, submission_type, rep
     Bulk insert into MasterRawRegistry using fast_executemany. At 70-150k
     rows/file (confirmed volume), row-by-row executemany would be far too
     slow -- fast_executemany batches the ODBC calls.
-    """
-    records = []
-    identity_json = build_identity_fields_json(df, submission_type)
 
+    Returns df with a new 'RawRecordID' column merged on -- NOT the raw_ids
+    lookup table separately. Downstream (write_unl, upsert_clean_registry)
+    reads RawRecordID directly off each row as it flows through
+    pipeline.run_pipeline(), so this merge has to happen correctly before
+    that call, not after.
+
+    The merge uses a per-row GUID generated in Python BEFORE insert, not
+    IdentityKey. IdentityKey alone is NOT reliably unique within one file --
+    an overdraft facility can legitimately report several rows with the
+    same FacilityAccNum+CustomerID but different dates in one submission.
+    A GUID generated per physical row and round-tripped through the insert
+    sidesteps that ambiguity entirely, at the cost of one extra SELECT.
+    """
+    df = df.copy()
+    df["_IngestRowGUID"] = [str(uuid.uuid4()) for _ in range(len(df))]
+
+    identity_json = build_identity_fields_json(df, submission_type)
+    records = []
     for i, row in df.iterrows():
         records.append({
             "SubmissionID": submission_id,
@@ -250,33 +266,38 @@ def bulk_insert_raw(conn, df, submission_id, subscriber_id, submission_type, rep
             "CurBal": pipeline.parse_decimal_value(row.get(config.BALANCE_COL)),
             "ContentHash": row["_ContentHash"],
             "IdentityFieldsJSON": json.dumps(identity_json[i] if i < len(identity_json) else {}),
-            "RawPayload": json.dumps(row.drop(labels=["_ContentHash"], errors="ignore").to_dict(), default=str),
+            "IngestRowGUID": row["_IngestRowGUID"],
         })
 
     out_df = pd.DataFrame(records)
-    out_df.to_sql("MasterRawRegistry", conn, if_exists="append", index=False, method="multi", chunksize=1000)
+    # chunksize=100 (not 1000): with 12 columns/row, 1000 would bind 12,000
+    # parameters in one statement -- SQL Server's hard limit is 2100 per
+    # statement. 100 keeps this at 1,200, safely under.
+    out_df.to_sql("MasterRawRegistry", conn, if_exists="append", index=False, method="multi", chunksize=100)
 
-    # Pull back RawRecordIDs for this submission so downstream steps (dedup
-    # marking, clean/unl writes) can reference them. Reading through the
-    # SAME connection/transaction, so this sees the rows just inserted
-    # above even though nothing has committed yet.
-    return pd.read_sql(
-        "SELECT RawRecordID, IdentityKey, ContentHash FROM MasterRawRegistry WHERE SubmissionID = ?",
+    raw_ids = pd.read_sql(
+        "SELECT RawRecordID, IngestRowGUID FROM MasterRawRegistry WHERE SubmissionID = ?",
         conn, params=(submission_id,),
     )
+    df = df.merge(raw_ids, left_on="_IngestRowGUID", right_on="IngestRowGUID", how="left")
+    df = df.drop(columns=["_IngestRowGUID", "IngestRowGUID"])
+    return df
 
 
-def mark_duplicates(conn, dedup_log_df, raw_ids_df):
+def mark_duplicates(conn, dedup_log_df):
+    """
+    dedup_log_df carries RawRecordID directly now (it rides along from
+    bulk_insert_raw's merge, through pipeline.deduplicate() unchanged) --
+    target it directly rather than re-matching on IdentityKey+ContentHash,
+    which could ambiguously hit more than one row if two genuinely
+    different rows happened to share both values.
+    """
     if dedup_log_df.empty:
         return
     for _, r in dedup_log_df.iterrows():
         conn.exec_driver_sql(
-            """UPDATE MasterRawRegistry SET IsDuplicate = 1, DedupReason = ?
-               WHERE RawRecordID IN (
-                   SELECT RawRecordID FROM MasterRawRegistry
-                   WHERE IdentityKey = ? AND ContentHash = ?
-               )""",
-            (r["Dedup Reason"], r.get("IdentityKey", ""), r.get("_ContentHash", "")),
+            "UPDATE MasterRawRegistry SET IsDuplicate = 1, DedupReason = ? WHERE RawRecordID = ?",
+            (r["Dedup Reason"], r["RawRecordID"]),
         )
 
 
@@ -313,7 +334,14 @@ def upsert_clean_registry(conn, df, submission_type, reporting_period, match_cat
         )
 
 
-def write_unl(conn, unl_df):
+def write_unl(conn, unl_df, reporting_period):
+    """
+    reporting_period is passed explicitly -- unl_df never actually carried
+    a 'ReportingPeriod' column (nothing in pipeline.py's classification
+    functions sets one), so r.get("ReportingPeriod", "") was silently
+    writing blank periods into every UNL record. Matches the pattern
+    upsert_clean_registry already used correctly.
+    """
     if unl_df.empty:
         return
     for _, r in unl_df.iterrows():
@@ -321,7 +349,7 @@ def write_unl(conn, unl_df):
             """INSERT INTO MasterUNLRegistry
                (RawRecordID, IdentityKey, ReportingPeriod, ExceptionCategory, Details)
                VALUES (?, ?, ?, ?, ?)""",
-            (r.get("RawRecordID"), r["IdentityKey"], r.get("ReportingPeriod", ""),
+            (r.get("RawRecordID"), r["IdentityKey"], reporting_period,
              r["Exception Category"], r.get("Field Differences", None)),
         )
 
@@ -390,7 +418,9 @@ def process_file(engine, file_path_or_buffer, filename):
     with engine.begin() as conn:
         subscriber_id = get_or_create_subscriber(conn, meta["subscriber_code"])
         submission_id = create_submission(conn, subscriber_id, meta, len(df))
-        raw_ids = bulk_insert_raw(conn, df, submission_id, subscriber_id, submission_type, meta["reporting_period"])
+        # df now carries a real RawRecordID per row (merged in via GUID) --
+        # this is the df that flows into run_pipeline, not the pre-insert one.
+        df = bulk_insert_raw(conn, df, submission_id, subscriber_id, submission_type, meta["reporting_period"])
 
         prev_raw, prev_clean, prev_unl = load_previous_registry_data(
             conn, subscriber_id, submission_type, meta["reporting_period"]
@@ -398,12 +428,12 @@ def process_file(engine, file_path_or_buffer, filename):
 
         outputs, summary = pipeline.run_pipeline(df, prev_raw, prev_clean, submission_type, prev_unl)
 
-        mark_duplicates(conn, outputs["dedup_log"], raw_ids)
+        mark_duplicates(conn, outputs["dedup_log"])
         write_date_change_log(conn, outputs["date_change_log"])
         upsert_clean_registry(conn, outputs["cleaned_output"], submission_type, meta["reporting_period"], "Exact")
         upsert_clean_registry(conn, outputs["rearranged_output"], submission_type, meta["reporting_period"], "Rearranged")
         upsert_clean_registry(conn, outputs["enriched_output"], submission_type, meta["reporting_period"], "Enriched")
-        write_unl(conn, outputs["unl_output"])
+        write_unl(conn, outputs["unl_output"], meta["reporting_period"])
         # Reaching here without an exception means every step above
         # succeeded -- `with engine.begin()` commits on clean exit. Any
         # exception anywhere above rolls back the WHOLE block instead.
